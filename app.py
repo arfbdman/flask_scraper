@@ -1,40 +1,39 @@
 import os
 import requests
-import zipfile
-from time import sleep
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
 from bs4 import BeautifulSoup
-from flask import Flask, render_template, jsonify, request, send_file
+from flask import Flask, request, jsonify, render_template, send_file
 from flask_cors import CORS
 import openpyxl
+from time import sleep
 
 
 # Flask setup
 app = Flask(__name__)
 CORS(app)
 
-# Render's writable temporary directory for output
-OUTPUT_DIRECTORY = "/tmp/output"
+# Determine your local Downloads folder
+DOWNLOAD_DIRECTORY = os.path.join(os.path.expanduser("~"), "Downloads", "Scraper_Output")
 
-# Headers to mimic a real browser
+# User-Agent header to mimic browser requests
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0 Safari/537.36"
 }
 
-# Retry configuration for handling request failures
+# Retry settings
 RETRY_COUNT = 3
 RETRY_DELAY = 2  # seconds
 
 
 def create_directory(folder_name):
-    """Create a directory if it doesn't exist."""
+    """Create directory if it doesn't exist."""
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
 
 
 def send_request_with_retries(url):
-    """Send an HTTP GET request with retries."""
+    """Send an HTTP GET request with retry logic."""
     for attempt in range(RETRY_COUNT):
         try:
             response = requests.get(url, headers=HEADERS, timeout=10)
@@ -51,16 +50,16 @@ def send_request_with_retries(url):
 def download_file(url, folder_name, fallback_format="unknown"):
     """Download a file from the given URL."""
     try:
-        # Extract the filename and clean query strings
+        # Clean filename and determine extension
         filename = os.path.basename(url.split("?")[0]) or f"image_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         extension = None
         if "." in filename:
             extension = filename.split(".")[-1].lower()
 
-        # Send the HTTP request
+        # Send request
         response = send_request_with_retries(url)
 
-        # If no valid extension, determine it based on the MIME type
+        # Determine extension from Content-Type if needed
         if not extension or extension not in ["jpg", "jpeg", "png", "gif", "bmp", "webp"]:
             content_type = response.headers.get("Content-Type", "").lower()
             if "jpeg" in content_type:
@@ -76,11 +75,10 @@ def download_file(url, folder_name, fallback_format="unknown"):
             else:
                 extension = fallback_format
 
-        # Save the image to the designated folder
+        # Save to folder
         format_folder = os.path.join(folder_name, extension)
         create_directory(format_folder)
         file_path = os.path.join(format_folder, f"{os.path.splitext(filename)[0]}.{extension}")
-
         with open(file_path, "wb") as file:
             file.write(response.content)
 
@@ -92,19 +90,17 @@ def download_file(url, folder_name, fallback_format="unknown"):
 
 
 def extract_images_and_metadata(url, output_folder):
-    """Extract images and metadata from a webpage."""
+    """Extract images and metadata from a URL."""
     try:
-        # Send the request to fetch the HTML
+        # Fetch the webpage
         response = send_request_with_retries(url)
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Extract the page title
+        # Extract metadata
         title = soup.title.string if soup.title else "No Title Available"
-
-        # Extract the project name
         project_name = urlparse(url).path.strip("/").split("/")[-1] or "default_project"
 
-        # Create a folder for the project
+        # Create a folder for this project
         project_folder = os.path.join(output_folder, project_name)
         create_directory(project_folder)
 
@@ -115,7 +111,7 @@ def extract_images_and_metadata(url, output_folder):
             for img in img_tags if img.get("src") or img.get("data-src") or img.get("data-lazy-src")
         ]
 
-        # Download the images
+        # Download images
         downloaded_images = []
         for img_url in img_urls:
             file_path = download_file(img_url, project_folder)
@@ -127,7 +123,7 @@ def extract_images_and_metadata(url, output_folder):
             "title": title,
             "project_name": project_name,
             "image_count": len(downloaded_images),
-            "project_folder": project_folder
+            "project_folder": project_folder,
         }
     except requests.exceptions.RequestException as e:
         print(f"Error processing URL {url}: {e}")
@@ -135,7 +131,7 @@ def extract_images_and_metadata(url, output_folder):
 
 
 def save_to_excel(data, output_folder):
-    """Save scraping results to an Excel file."""
+    """Save metadata and results to an Excel file."""
     excel_file_path = os.path.join(output_folder, "Scraped_Data.xlsx")
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -148,23 +144,10 @@ def save_to_excel(data, output_folder):
             entry.get("project_name", ""),
             entry.get("image_count", 0),
             entry.get("project_folder", ""),
-            "Yes" if "error" in entry else "No"
+            "Yes" if "error" in entry else "No",
         ])
     wb.save(excel_file_path)
     return excel_file_path
-
-
-def create_zip(output_folder):
-    """Compress the output folder into a ZIP file."""
-    zip_file_path = os.path.join(OUTPUT_DIRECTORY, f"Scraped_Data_{datetime.now().strftime('%Y%m%d%H%M%S')}.zip")
-    with zipfile.ZipFile(zip_file_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(output_folder):
-            for file in files:
-                full_path = os.path.join(root, file)
-                arcname = os.path.relpath(full_path, output_folder)
-                zipf.write(full_path, arcname)
-    print(f"ZIP File Created: {zip_file_path}")
-    return zip_file_path
 
 
 @app.route("/")
@@ -174,42 +157,43 @@ def index():
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
-    """Scrape endpoint to fetch images and metadata."""
+    """Main endpoint for scraping."""
     urls = request.json.get("urls", [])
     if not urls:
         return jsonify({"error": "No URLs provided."}), 400
 
-    # Create a unique folder for the scrape job
-    output_folder = os.path.join(OUTPUT_DIRECTORY, f"scraped_{datetime.now().strftime('%Y%m%d%H%M%S')}")
+    # Create output directory for the scrape
+    output_folder = os.path.join(DOWNLOAD_DIRECTORY, f"scraped_{datetime.now().strftime('%Y%m%d%H%M%S')}")
     create_directory(output_folder)
 
-    # Process each URL
+    # Process all URLs
     results = []
     for url in urls:
         result = extract_images_and_metadata(url, output_folder)
         results.append(result)
 
-        # Small delay to avoid being flagged
+        # Add delay to avoid being flagged
         sleep(1)
 
-    # Save metadata to Excel and create a ZIP archive
-    save_to_excel(results, output_folder)
-    zip_file_path = create_zip(output_folder)
+    # Save Excel metadata
+    excel_file_path = save_to_excel(results, output_folder)
 
+    # Return status and file paths
     return jsonify({
-        "message": "Scraping completed!",
-        "zip_file_path": zip_file_path,
+        "message": "Scraping completed! Files have been saved to your Downloads folder.",
+        "output_folder": output_folder,
+        "excel_file": excel_file_path,
         "results": results,
     })
 
 
-@app.route("/download", methods=["GET"])
-def download():
-    """Serve the ZIP file for download."""
-    zip_file_path = request.args.get("path")
-    if not zip_file_path or not os.path.exists(zip_file_path):
+@app.route("/download_excel", methods=["GET"])
+def download_excel():
+    """Serve the Excel file for download."""
+    excel_file_path = request.args.get("path")
+    if not excel_file_path or not os.path.exists(excel_file_path):
         return jsonify({"error": "File not found."}), 404
-    return send_file(zip_file_path, as_attachment=True)
+    return send_file(excel_file_path, as_attachment=True)
 
 
 if __name__ == "__main__":
