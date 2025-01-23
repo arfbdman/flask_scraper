@@ -10,11 +10,11 @@ from flask_cors import CORS
 import openpyxl
 
 
-# Flask app setup
+# Flask setup
 app = Flask(__name__)
 CORS(app)
 
-# Use Render's writable temporary directory
+# Render's writable temporary directory for output
 OUTPUT_DIRECTORY = "/tmp/output"
 
 # Headers to mimic a real browser
@@ -22,50 +22,67 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0 Safari/537.36"
 }
 
+# Retry configuration for handling request failures
+RETRY_COUNT = 3
+RETRY_DELAY = 2  # seconds
+
 
 def create_directory(folder_name):
-    """Create directory if it doesn't exist."""
+    """Create a directory if it doesn't exist."""
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
 
 
+def send_request_with_retries(url):
+    """Send an HTTP GET request with retries."""
+    for attempt in range(RETRY_COUNT):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=10)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed for {url} (attempt {attempt + 1}/{RETRY_COUNT}): {e}")
+            if attempt < RETRY_COUNT - 1:
+                sleep(RETRY_DELAY)
+            else:
+                raise e
+
+
 def download_file(url, folder_name, fallback_format="unknown"):
-    """Download a file from a URL."""
+    """Download a file from the given URL."""
     try:
-        # Extract the filename and extension
+        # Extract the filename and clean query strings
         filename = os.path.basename(url.split("?")[0]) or f"image_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        extension = None
         if "." in filename:
             extension = filename.split(".")[-1].lower()
-        else:
-            extension = None
 
-        # Fetch the image with headers
-        with requests.get(url, stream=True, timeout=10, headers=HEADERS) as response:
-            response.raise_for_status()
-            
-            if not extension or extension not in ["jpg", "jpeg", "png", "gif", "bmp", "webp"]:
-                content_type = response.headers.get("Content-Type", "").lower()
-                if "jpeg" in content_type:
-                    extension = "jpg"
-                elif "png" in content_type:
-                    extension = "png"
-                elif "gif" in content_type:
-                    extension = "gif"
-                elif "bmp" in content_type:
-                    extension = "bmp"
-                elif "webp" in content_type:
-                    extension = "webp"
-                else:
-                    extension = fallback_format
+        # Send the HTTP request
+        response = send_request_with_retries(url)
 
-            # Save file to appropriate folder
-            format_folder = os.path.join(folder_name, extension)
-            create_directory(format_folder)
-            file_path = os.path.join(format_folder, f"{os.path.splitext(filename)[0]}.{extension}")
-            
-            with open(file_path, "wb") as file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    file.write(chunk)
+        # If no valid extension, determine it based on the MIME type
+        if not extension or extension not in ["jpg", "jpeg", "png", "gif", "bmp", "webp"]:
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "jpeg" in content_type:
+                extension = "jpg"
+            elif "png" in content_type:
+                extension = "png"
+            elif "gif" in content_type:
+                extension = "gif"
+            elif "bmp" in content_type:
+                extension = "bmp"
+            elif "webp" in content_type:
+                extension = "webp"
+            else:
+                extension = fallback_format
+
+        # Save the image to the designated folder
+        format_folder = os.path.join(folder_name, extension)
+        create_directory(format_folder)
+        file_path = os.path.join(format_folder, f"{os.path.splitext(filename)[0]}.{extension}")
+
+        with open(file_path, "wb") as file:
+            file.write(response.content)
 
         print(f"Downloaded: {file_path}")
         return file_path
@@ -77,26 +94,28 @@ def download_file(url, folder_name, fallback_format="unknown"):
 def extract_images_and_metadata(url, output_folder):
     """Extract images and metadata from a webpage."""
     try:
-        response = requests.get(url, timeout=10, headers=HEADERS)
-        response.raise_for_status()
+        # Send the request to fetch the HTML
+        response = send_request_with_retries(url)
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Extract page title and project name
+        # Extract the page title
         title = soup.title.string if soup.title else "No Title Available"
+
+        # Extract the project name
         project_name = urlparse(url).path.strip("/").split("/")[-1] or "default_project"
 
-        # Create project folder
+        # Create a folder for the project
         project_folder = os.path.join(output_folder, project_name)
         create_directory(project_folder)
 
-        # Find image URLs
+        # Extract image URLs
         img_tags = soup.find_all("img")
         img_urls = [
             urljoin(url, img.get("src") or img.get("data-src") or img.get("data-lazy-src"))
             for img in img_tags if img.get("src") or img.get("data-src") or img.get("data-lazy-src")
         ]
 
-        # Download images
+        # Download the images
         downloaded_images = []
         for img_url in img_urls:
             file_path = download_file(img_url, project_folder)
@@ -116,7 +135,7 @@ def extract_images_and_metadata(url, output_folder):
 
 
 def save_to_excel(data, output_folder):
-    """Save scraping metadata to an Excel file."""
+    """Save scraping results to an Excel file."""
     excel_file_path = os.path.join(output_folder, "Scraped_Data.xlsx")
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -136,13 +155,13 @@ def save_to_excel(data, output_folder):
 
 
 def create_zip(output_folder):
-    """Create a ZIP file of the entire output folder."""
+    """Compress the output folder into a ZIP file."""
     zip_file_path = os.path.join(OUTPUT_DIRECTORY, f"Scraped_Data_{datetime.now().strftime('%Y%m%d%H%M%S')}.zip")
     with zipfile.ZipFile(zip_file_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, _, files in os.walk(output_folder):
             for file in files:
                 full_path = os.path.join(root, file)
-                arcname = os.path.relpath(full_path, output_folder)  # Keep the folder structure inside the ZIP
+                arcname = os.path.relpath(full_path, output_folder)
                 zipf.write(full_path, arcname)
     print(f"ZIP File Created: {zip_file_path}")
     return zip_file_path
@@ -155,25 +174,25 @@ def index():
 
 @app.route("/scrape", methods=["POST"])
 def scrape():
-    """Main scraping endpoint."""
+    """Scrape endpoint to fetch images and metadata."""
     urls = request.json.get("urls", [])
     if not urls:
         return jsonify({"error": "No URLs provided."}), 400
 
-    # Create a unique folder for this scrape job
+    # Create a unique folder for the scrape job
     output_folder = os.path.join(OUTPUT_DIRECTORY, f"scraped_{datetime.now().strftime('%Y%m%d%H%M%S')}")
     create_directory(output_folder)
 
-    # Process all URLs
+    # Process each URL
     results = []
     for url in urls:
         result = extract_images_and_metadata(url, output_folder)
         results.append(result)
 
-        # Add a delay between requests
+        # Small delay to avoid being flagged
         sleep(1)
 
-    # Save metadata to Excel and create ZIP archive
+    # Save metadata to Excel and create a ZIP archive
     save_to_excel(results, output_folder)
     zip_file_path = create_zip(output_folder)
 
@@ -186,7 +205,7 @@ def scrape():
 
 @app.route("/download", methods=["GET"])
 def download():
-    """Serve the ZIP output file for download."""
+    """Serve the ZIP file for download."""
     zip_file_path = request.args.get("path")
     if not zip_file_path or not os.path.exists(zip_file_path):
         return jsonify({"error": "File not found."}), 404
